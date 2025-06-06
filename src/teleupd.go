@@ -1,85 +1,114 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"net/http"
+	"log"
+	"time"
 )
 
-type telegram_update_response struct {
-	Ok     bool              `json:"ok"`
-	Result []telegram_update `json:"result"`
-}
-type telegram_update struct {
-	UpdateId int64            `json:"update_id"`
-	Message  telegram_message `json:"message"`
-}
-type telegram_message struct {
-	MessageId int64         `json:"message_id"`
-	From      telegram_user `json:"from"`
-	Chat      telegram_chat `json:"chat"`
-	Date      int64         `json:"date"`
-	Text      string        `json:"text"`
-}
-type telegram_user struct {
-	Id           int64  `json:"id"`
-	IsBot        bool   `json:"is_bot"`
-	FirstName    string `json:"first_name"`
-	LastName     string `json:"last_name"`
-	Username     string `json:"username"`
-	LanguageCode string `json:"language_code"`
-	IsPremium    bool   `json:"is_premium"`
-}
-type telegram_chat struct {
-	Id        int64  `json:"id"`
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
-	Username  string `json:"username"`
-	Type      string `json:"type"`
+type UpdateHandler struct {
+	client      *TelegramClient
+	messageChan chan MessageEvent
+	inlineChan  chan InlineEvent
+	stopChan    chan struct{}
 }
 
-func update(offset int64) []telegram_update {
-	url := api_url_get + fmt.Sprintf("?offset=%d", offset)
-again:
-	resp, err := http.Get(url)
-	if err != nil {
-		goto again
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-
-	if err != nil {
-		goto again
-	}
-	var Response telegram_update_response
-	fmt.Println(string(body))
-	err = json.Unmarshal(body, &Response)
-	if err != nil {
-		goto again
-	}
-
-	return Response.Result
+type MessageEvent struct {
+	UserID int64
+	Text   string
 }
-func Recv() {
+
+type InlineEvent struct {
+	QueryID string
+	UserID  int64
+	Query   string
+}
+
+func NewUpdateHandler(client *TelegramClient) *UpdateHandler {
+	return &UpdateHandler{
+		client:      client,
+		messageChan: make(chan MessageEvent, 100),
+		inlineChan:  make(chan InlineEvent, 100),
+		stopChan:    make(chan struct{}),
+	}
+}
+
+func (h *UpdateHandler) Start(ctx context.Context) {
+	go h.pollUpdates(ctx)
+}
+
+func (h *UpdateHandler) Stop() {
+	close(h.stopChan)
+}
+
+func (h *UpdateHandler) GetMessageChannel() <-chan MessageEvent {
+	return h.messageChan
+}
+
+func (h *UpdateHandler) GetInlineChannel() <-chan InlineEvent {
+	return h.inlineChan
+}
+
+func (h *UpdateHandler) pollUpdates(ctx context.Context) {
 	offset := int64(0)
-	info := update(offset)
-	offset = info[len(info)-1].UpdateId
+	backoff := time.Second
+
 	for {
-		info := update(offset)
-		if len(info) > 0 {
-			/*go func() {
-				STRUCTURES.UserNamesByIdMu.Lock()
-				STRUCTURES.UsernamesById[info[len(info)-1].Message.Chat.ChatId] = info[len(info)-1].Message.Chat.Username
-				STRUCTURES.UserNamesByIdMu.Unlock()
-			}() NOT NEEDED RN*/
-			offset = (info[len(info)-1].UpdateId) + 1
-			text := info[len(info)-1].Message.Text
-			userId := info[len(info)-1].Message.Chat.Id
-			inner_mutex_1.Lock()
-			inner_uid = userId
-			inner_txtc = text
-			inner_mutex_1.Unlock()
+		select {
+		case <-h.stopChan:
+			return
+		case <-ctx.Done():
+			return
+		default:
+			updates, err := h.client.GetUpdates(ctx, offset)
+			if err != nil {
+				log.Printf("Ошибка при получении обновлений: %v", err)
+
+				if ctx.Err() != nil {
+					log.Println("Контекст был отменен, останавливаем обработку обновлений")
+					return
+				}
+
+				time.Sleep(backoff)
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+				continue
+			}
+
+			backoff = time.Second
+
+			if len(updates) > 0 {
+				for _, update := range updates {
+					updateJSON, _ := json.MarshalIndent(update, "", "  ")
+					log.Printf("Получено новое обновление:\n%s", string(updateJSON))
+
+					// Обрабатываем обычные сообщения
+					if update.Message.Text != "" {
+						h.messageChan <- MessageEvent{
+							UserID: update.Message.Chat.ID,
+							Text:   update.Message.Text,
+						}
+					}
+
+					// Обрабатываем inline запросы
+					if update.InlineQuery != nil {
+						log.Printf("Получен inline запрос: %s от пользователя %d",
+							update.InlineQuery.Query, update.InlineQuery.From.ID)
+
+						h.inlineChan <- InlineEvent{
+							QueryID: update.InlineQuery.ID,
+							UserID:  update.InlineQuery.From.ID,
+							Query:   update.InlineQuery.Query,
+						}
+					}
+
+					if update.UpdateID >= offset {
+						offset = update.UpdateID + 1
+					}
+				}
+			}
 		}
 	}
 }
