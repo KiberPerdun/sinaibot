@@ -1,246 +1,451 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
+/* ---------- session ---------------------------------------------------- */
+
+var chatid_to_user map[int64]telegramUser
+
 type UserSession struct {
 	userID       int64
 	messageChan  chan string
 	lastActivity time.Time
-	client       *TelegramClient
+	client       *tgClient
+	User         telegramUser
 }
 
-func NewUserSession(userID int64, client *TelegramClient) *UserSession {
+func newUserSession(uid int64, c *tgClient) *UserSession {
 	return &UserSession{
-		userID:       userID,
+		userID:       uid,
 		messageChan:  make(chan string, 10),
-		client:       client,
 		lastActivity: time.Now(),
+		client:       c,
 	}
 }
 
-func (s *UserSession) Start(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
+func getbilling(msg string, c *tgClient, chatid int64) {
+	if msg != "/billing" {
+		return
+	}
 
-	fmt.Printf("Начата сессия для пользователя %d\n", s.userID)
+	f, err := os.ReadFile("/home/sinaibot/openai_billing")
+	if err != nil {
+		logerr(err, "error reading file", "getbilling")
+		return
+	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Printf("Завершение сессии пользователя %d по контексту\n", s.userID)
-			return
+	sendMessage(c, chatid, string(f))
+}
 
-		case message, ok := <-s.messageChan:
-			if !ok {
-				fmt.Printf("Канал сообщений закрыт для пользователя %d\n", s.userID)
+var lastcontextusage int64
+
+func checkai_req(msg string, chatID int64, username string, c *tgClient) {
+	if strings.Split(msg, " ")[0] != "/ai" {
+		return
+	}
+	// разбиваем команду на поля
+	parts := strings.Fields(msg)
+	// нужно минимум: /ai model=... -context=... вопрос
+	if len(parts) < 4 || parts[0] != "/ai" {
+		_ = sendMessage(c, chatID,
+			fmt.Sprintf("%s, неверный формат. Используй: /ai -model=... -context=... вопрос", username))
+		return
+	}
+
+	var model, context, question string
+	idx := 1
+	// проходим по флагам
+	for ; idx < len(parts); idx++ {
+		token := parts[idx]
+		if strings.HasPrefix(token, "-model=") {
+			model = strings.TrimPrefix(token, "-model=")
+		} else if strings.HasPrefix(token, "-context=") {
+			context = strings.TrimPrefix(token, "-context=")
+		} else {
+			break
+		}
+	}
+	// остальное — это сам запрос
+	question = strings.Join(parts[idx:], " ")
+
+	// проверяем, что всё есть
+	if model == "" || context == "" || question == "" {
+		_ = sendMessage(c, chatID,
+			fmt.Sprintf("%s, неверный формат. Пример: /ai model=gpt -context=твой_контекст вопрос", username))
+		return
+	}
+
+	// теперь model, context и question заданы — можно использовать дальше
+	switch model {
+	case "llama":
+		{
+			if context != "f" && context != "t" {
+				_ = sendMessage(c, chatID, "Контекст может быть только t или f")
 				return
 			}
 
-			s.lastActivity = time.Now()
-			fmt.Printf("Получено сообщение от пользователя %d: %s\n", s.userID, message)
-
-			err := s.client.SendMessage(ctx, s.userID, message)
-			if err != nil {
-				// Улучшенный вывод ошибок с рекомендациями
-				log.Printf("Ошибка отправки сообщения пользователю %d: %v\n", s.userID, err)
-
-				// Добавляем рекомендации по типичным ошибкам
-				errStr := strings.ToLower(err.Error())
-				if strings.Contains(errStr, "bad request") && strings.Contains(errStr, "markdown") {
-					log.Printf("Совет: Проблема с разбором Markdown. Проверьте синтаксис или отключите ParseMode в SendMessage")
-				} else if strings.Contains(errStr, "forbidden") {
-					log.Printf("Совет: Бот не может отправить сообщение - пользователь мог заблокировать бота или удалить чат")
-				} else if strings.Contains(errStr, "too many requests") {
-					log.Printf("Совет: Превышены ограничения API Telegram. Сократите частоту запросов")
-				}
+			if context != "f" {
+				_ = sendMessage(c, chatID, "Модель не поддерживает контекст")
 			}
+
+			var err error
+			msgID, err := sendMessageRID(c, chatID,
+				fmt.Sprintf("генерация (model=%s, context=%s) началась...", model, context))
+			if err != nil {
+				logerr(err, "sendMessage", "checkai_req")
+				return
+			}
+
+			// передаём модель и вопрос в стрим-генерацию (добавь context в сам вызов, если поддерживается)
+			wordsChan, err := streamGenerateTextLLAMA70(model, question)
+			if err != nil {
+				logerr(err, "streamGenerate", "checkai_req")
+				return
+			}
+
+			go accumulateAndEdit(c, chatID, msgID, username, wordsChan)
+		}
+	case "llama7b":
+		{
+			if context != "f" && context != "t" {
+				_ = sendMessage(c, chatID, "Контекст может быть только t или f")
+				return
+			}
+
+			if context != "f" {
+				_ = sendMessage(c, chatID, "Модель не поддерживает контекст")
+			}
+
+			// передаём модель и вопрос в стрим-генерацию (добавь context в сам вызов, если поддерживается)
+			answer, err := GenerateTextLLAMA9(question)
+			if err != nil {
+				logerr(err, "streamGenerate", "checkai_req")
+				return
+			}
+
+			sendMessage(c, chatID, answer)
+		}
+	case "llama13b":
+		{
+			if context != "f" && context != "t" {
+				_ = sendMessage(c, chatID, "Контекст может быть только t или f")
+				return
+			}
+
+			if context != "f" {
+				_ = sendMessage(c, chatID, "Модель не поддерживает контекст")
+			}
+
+			// передаём модель и вопрос в стрим-генерацию (добавь context в сам вызов, если поддерживается)
+			answer, err := GenerateTextLLAMA13B(question)
+			if err != nil {
+				logerr(err, "streamGenerate", "checkai_req")
+				return
+			}
+
+			sendMessage(c, chatID, answer)
+		}
+	case "gpt":
+		{
+			var last100 string
+			var err error
+
+			if context != "f" && context != "t" {
+				_ = sendMessage(c, chatID, "Контекст может быть только t или f")
+				return
+			}
+
+			if context == "t" {
+				if lastcontextusage != 0 && (time.Now().Unix()-lastcontextusage) < 60*30 {
+					sendMessage(c, chatID, "Вы не можете использовать контекст чаще, чем 1 раз в 30 минут. Генерация продолжится без контекста")
+					last100 = "NONE"
+					goto nocontext
+				}
+				lastcontextusage = time.Now().Unix()
+				last100, err = GetLast100Msgs()
+				if err != nil {
+					logerr(err, "getting last msgs", "checkai_req")
+					last100 = "NONE"
+				}
+			} else {
+				last100 = "NONE"
+			}
+
+		nocontext:
+
+			_ = sendMessage(c, chatID, fmt.Sprintf("%s, генерация (model=%s, context=%s) началась...", username, model, context))
+
+			answer, err := GenerateTextChatgpt(msg, last100)
+			if err != nil {
+				logerr(err, "error generating response", "checkai_req")
+			}
+			err = sendMessage(c, chatID, fmt.Sprintf("@%s, %s", username, answer))
+			if err != nil {
+				err = sendMessage(c, chatID, answer)
+			}
+		}
+	default:
+		{
+			_ = sendMessage(c, chatID, "model not found model="+model)
 		}
 	}
 }
+func startUserSession(wg *sync.WaitGroup, s *UserSession) {
+	defer wg.Done()
+	log.Printf("[session %d] started", s.userID)
 
-type SessionManager struct {
-	sessions     map[int64]*UserSession
-	client       *TelegramClient
-	sessionMutex sync.Mutex
+	for msg := range s.messageChan {
+		user := chatid_to_user[s.userID]
+		go func(user telegramUser, msg string) {
+			spioniro_golubiro(user, msg)
+		}(user, msg)
+
+		s.lastActivity = time.Now()
+
+		checkai_req(msg, s.userID, user.Username, s.client)
+		getbilling(msg, s.client, s.userID)
+		//fmt.Println(msg, s.User)
+		/*if err := sendMessage(s.client, s.userID, msg); err != nil {
+			diagnoseTelegramError(err)
+		}*/
+	}
+	log.Printf("[session %d] stopped", s.userID)
 }
 
-func NewSessionManager(client *TelegramClient) *SessionManager {
-	return &SessionManager{
-		sessions: make(map[int64]*UserSession),
-		client:   client,
+func diagnoseTelegramError(err error) {
+	e := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(e, "bad request") && strings.Contains(e, "markdown"):
+		log.Println("Совет: проверьте Markdown или уберите ParseMode")
+	case strings.Contains(e, "forbidden"):
+		log.Println("Совет: пользователь заблокировал бота или удалил чат")
+	case strings.Contains(e, "too many requests"):
+		log.Println("Совет: превысил лимит Telegram API — замедлитесь")
 	}
 }
 
-func (m *SessionManager) ProcessMessage(ctx context.Context, wg *sync.WaitGroup, userID int64, text string) {
-	m.sessionMutex.Lock()
-	defer m.sessionMutex.Unlock()
+/* ---------- store ------------------------------------------------------ */
 
-	session, exists := m.sessions[userID]
-	if !exists {
-		session = NewUserSession(userID, m.client)
-		m.sessions[userID] = session
+type sessionsStore struct {
+	mu   sync.Mutex
+	data map[int64]*UserSession
+}
 
+func newSessionsStore() *sessionsStore { return &sessionsStore{data: make(map[int64]*UserSession)} }
+
+func processMessage(wg *sync.WaitGroup, st *sessionsStore, uid int64, text string, c *tgClient) {
+	st.mu.Lock()
+	sess, ok := st.data[uid]
+	if !ok {
+		sess = newUserSession(uid, c)
+		st.data[uid] = sess
 		wg.Add(1)
-		go session.Start(ctx, wg)
+		go startUserSession(wg, sess)
 	}
+	st.mu.Unlock()
 
-	session.messageChan <- text
+	sess.messageChan <- text
 }
 
-func (m *SessionManager) CloseAllSessions() {
-	m.sessionMutex.Lock()
-	defer m.sessionMutex.Unlock()
-
-	for userID, session := range m.sessions {
-		fmt.Printf("Закрытие сессии пользователя %d\n", userID)
-		close(session.messageChan)
-		delete(m.sessions, userID)
+func closeAllSessions(st *sessionsStore) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for id, s := range st.data {
+		log.Printf("closing session %d", id)
+		close(s.messageChan)
+		delete(st.data, id)
 	}
 }
 
-func processInlineCommand(query string) (string, string) {
-	query = strings.TrimSpace(query)
+/* ---------- inline utils ----------------------------------------------- */
+/*
+func processInlineCommand(q string) (string, string) {
+	q = strings.TrimSpace(q)
 
-	if strings.HasPrefix(query, "/time") {
-		now := time.Now().Format("15:04:05")
-		return "Текущее время", fmt.Sprintf("Сейчас: *%s*", now)
-
-	} else if strings.HasPrefix(query, "/date") {
-		now := time.Now().Format("02.01.2006")
-		return "Текущая дата", fmt.Sprintf("Сегодня: *%s*", now)
-
-	} else if strings.HasPrefix(query, "/bold ") {
-		text := strings.TrimPrefix(query, "/bold ")
-		return "Жирный текст", fmt.Sprintf("*%s*", text)
-
-	} else if strings.HasPrefix(query, "/italic ") {
-		text := strings.TrimPrefix(query, "/italic ")
-		return "Курсивный текст", fmt.Sprintf("_%s_", text)
-
-	} else if strings.HasPrefix(query, "/help") || query == "" {
-		return "Справка по командам",
-			"*Доступные inline команды:*\n" +
-				"- `/time` - показать текущее время\n" +
-				"- `/date` - показать текущую дату\n" +
-				"- `/bold текст` - выделить текст жирным\n" +
-				"- `/italic текст` - выделить текст курсивом\n" +
-				"- `/help` - показать справку"
+	switch {
+	case strings.HasPrefix(q, "/time"):
+		return "Текущее время", fmt.Sprintf("Сейчас: *%d*", time.Now().Unix())
+	case strings.HasPrefix(q, "/date"):
+		return "Текущая дата", fmt.Sprintf("Сегодня: *%s*", time.Now().Format("02.01.2006"))
+	case strings.HasPrefix(q, "/bold "):
+		return "Жирный текст", fmt.Sprintf("*%s*", strings.TrimPrefix(q, "/bold "))
+	case strings.HasPrefix(q, "/italic "):
+		return "Курсивный текст", fmt.Sprintf("_%s_", strings.TrimPrefix(q, "/italic "))
+	case strings.HasPrefix(q, "/help"), q == "":
+		return "Справка", "*Команды:* /time /date /bold /italic /help"
+	default:
+		return "Эхо", q
 	}
+}
+*/
+/* ---------- main ------------------------------------------------------- */
 
-	return "Эхо", query
+func checkCaptcha(userid int64, chatid int64, answer string, client *tgClient) {
+	timestart := time.Now().Unix()
+	uid_string := fmt.Sprintf("%d", userid)
+	for {
+		data, err := ReadLastNChars("/home/sinaibot/msgs", 2000)
+		if err != nil {
+			logerr(err, "error reading msg history", "checkCaptcha")
+		}
+		dataS := strings.Split(data, "\n")
+		n := len(dataS)
+		for i := 1; /* intended */ i < n; i++ {
+			line := dataS[i]
+			lineS := strings.Split(line, "|")
+			if len(lineS) != 4 {
+				continue
+			}
+			if lineS[1] != uid_string {
+				continue
+			}
+
+			if lineS[0] == answer {
+				firstname, _, err := GetUserNamesByID(userid)
+				if err != nil {
+					logerr(err, "error reading user names", "checkCaptcha")
+					err = sendMessage(client, chatid, fmt.Sprintf("UID %s успешно прошел каптчу", uid_string))
+					if err != nil {
+						logerr(err, "error sending message", "checkCaptcha")
+					}
+				}
+				err = sendMessage(client, chatid, fmt.Sprintf("%s, успешно прошел каптчу!", firstname))
+				if err != nil {
+					logerr(err, "error sending message", "checkCaptcha")
+				}
+				return
+			}
+		}
+
+		if time.Now().Unix()-timestart > 60*5 {
+			username, _, err := GetUserNamesByID(userid)
+			if err != nil {
+				logerr(err, "error reading user names", "checkCaptcha")
+				err = sendMessage(client, chatid, fmt.Sprintf("@Lomasterrr!!!!! UID %s (нет возможности получить username) не прошел каптчу!", uid_string))
+				if err != nil {
+					logerr(err, "error sending message", "checkCaptcha")
+				}
+			}
+			err = sendMessage(client, chatid, fmt.Sprintf("@Lomasterrr!!!!! UID %s (%s) не прошел каптчу!", userid, username))
+			if err != nil {
+				logerr(err, "error sending message", "checkCaptcha")
+			}
+			return
+		}
+	}
 }
 
 func main() {
-	log.SetOutput(os.Stdout)
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	chatid_to_user = make(map[int64]telegramUser)
+	prodToken, _ := loadTokens(keysFile)
 
-	prodToken, _ := GetBotTokens()
-	log.Println("API токены успешно загружены из переменных окружения")
+	openait, err := os.ReadFile("/home/sinaibot/openai_token")
+	if err != nil {
+		panic(err.Error())
+	}
+	OpenAIapiKey = string(openait)[:len(openait)-1]
+	fmt.Println(OpenAIapiKey)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	botToken = prodToken // pochinit' nado bi
+	client := newTGClient(prodToken)
 
-	client := NewTelegramClient(prodToken)
-
-	updateHandler := NewUpdateHandler(client)
-	updateHandler.Start(ctx)
-
-	sessionManager := NewSessionManager(client)
-
+	msgCh /* inlineCh*/, _, newMemCh, stopPoll := startUpdatePolling(client)
+	store := newSessionsStore()
 	var wg sync.WaitGroup
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	/* --- обработка приходящих событий --- */
 
-	// Обработка обычных сообщений
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-
-			case msg, ok := <-updateHandler.GetMessageChannel():
-				if !ok {
-					return
-				}
-				sessionManager.ProcessMessage(ctx, &wg, msg.UserID, msg.Text)
+		for n := range newMemCh {
+			_, username, err := GetUserNamesByID(n.UserID)
+			if err != nil {
+				logerr(err, "error reading user names", "checkCaptcha")
+				username = "новый пользователь"
 			}
+			text, err := RandomFNV8()
+			if err != nil {
+				logerr(err, "error generating random", "main")
+				continue
+			}
+			path := fmt.Sprintf("/home/sinaibot/captcha/%d.png", n.UserID)
+			err = RunCaptchaInVenv(path, text)
+			if err != nil {
+				logerr(err, "error generating captcha", "main")
+				continue
+			}
+			err = SendPhoto(n.ChatID, path, fmt.Sprintf("%s, пройдите каптчу.\nОтвет пишите прям в чат без каких-либо лишних символов. У вас есть 5 минут", username))
+			if err != nil {
+				logerr(err, "error sending photo", "main")
+				continue
+			}
+			go checkCaptcha(n.UserID, n.ChatID, text, client)
 		}
 	}()
 
-	// Обработка inline запросов
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
+		for m := range msgCh {
+			processMessage(&wg, store, m.UserID, m.Text, client)
+		}
+	}()
+	/*
+		go func() {
+			for iq := range inlineCh {
+				title, body := processInlineCommand(iq.Query)
 
-			case inlineQuery, ok := <-updateHandler.GetInlineChannel():
-				if !ok {
-					return
-				}
-
-				var results []InlineQueryResult
-				query := strings.TrimSpace(inlineQuery.Query)
-
-				title, resultText := processInlineCommand(query)
-
-				article := InlineQueryResultArticle{
-					Type:        "article",
-					ID:          "result",
-					Title:       title,
-					Description: "Нажмите, чтобы отправить",
-					InputMessage: InputMessageContent{
-						MessageText: resultText,
-						ParseMode:   "Markdown",
+				results := []inlineQueryResult{
+					inlineQueryResultArticle{
+						Type:  "article",
+						ID:    "result",
+						Title: title,
+						InputMessage: inputMessageContent{
+							MessageText: body,
+							ParseMode:   "Markdown",
+						},
 					},
 				}
-				results = append(results, article)
 
-				if !strings.HasPrefix(query, "/") && query != "" {
+				if !strings.HasPrefix(strings.TrimSpace(iq.Query), "/") && iq.Query != "" {
 					for i := 1; i <= 2; i++ {
-						resultID := strconv.Itoa(i)
-						echoArticle := InlineQueryResultArticle{
-							Type:        "article",
-							ID:          resultID,
-							Title:       fmt.Sprintf("Эхо %d: %s", i, query),
-							Description: "Нажмите, чтобы отправить это сообщение",
-							InputMessage: InputMessageContent{
-								MessageText: fmt.Sprintf("Эхо %d: %s", i, query),
+						id := strconv.Itoa(i)
+						echo := fmt.Sprintf("Эхо %d: %s", i, iq.Query)
+						results = append(results, inlineQueryResultArticle{
+							Type:  "article",
+							ID:    id,
+							Title: echo,
+							InputMessage: inputMessageContent{
+								MessageText: echo,
 								ParseMode:   "Markdown",
 							},
-						}
-						results = append(results, echoArticle)
+						})
 					}
 				}
 
-				err := client.AnswerInline(ctx, inlineQuery.QueryID, results)
-				if err != nil {
-					log.Printf("Ошибка ответа на inline запрос: %v", err)
+				if err := answerInline(client, iq.QueryID, results); err != nil {
+					log.Printf("answerInline error: %v", err)
 				}
 			}
-		}
-	}()
+		}()
 
+		NOT NEEDED RN
+	*/
+	/* --- ожидание Ctrl-C --- */
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
-	fmt.Println("\nПолучен сигнал завершения. Закрываемся...")
 
-	cancel()
-
-	updateHandler.Stop()
-
-	sessionManager.CloseAllSessions()
-
+	log.Println("shutting down…")
+	close(stopPoll) // останавливаем long-poll
+	closeAllSessions(store)
 	wg.Wait()
-	fmt.Println("Бот успешно остановлен")
+	log.Println("bye")
 }

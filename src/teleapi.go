@@ -2,371 +2,416 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
+/* ---------- константы ---------- */
+
 const (
-	APIBaseURL       = "https://api.telegram.org/bot"
-	GetUpdatesPath   = "/getUpdates"
-	SendMessagePath  = "/sendMessage"
-	AnswerInlinePath = "/answerInlineQuery"
-
-	LongPollTimeout = 30
-	HTTPTimeout     = 60 * time.Second
-
-	// Имена переменных окружения для токенов
-	EnvProdToken  = "TELEGRAM_PRODUCTION_TOKEN"
-	EnvAlertToken = "TELEGRAM_ALERT_TOKEN"
+	keysFile         = "/home/sinaibot/tgkeys2" // <-- путь к токенам
+	apiBaseURL       = "https://api.telegram.org/bot"
+	getUpdatesPath   = "/getUpdates"
+	sendMessagePath  = "/sendMessage"
+	editMessagePath  = "/editMessageText"
+	answerInlinePath = "/answerInlineQuery"
+	longPollTimeout  = 30
+	httpTimeout      = 60 * time.Second
 )
 
-type TelegramError struct {
-	OK          bool   `json:"ok"`
-	ErrorCode   int    `json:"error_code"`
-	Description string `json:"description"`
+var botToken string
+
+/* ---------- клиент ---------- */
+
+type tgClient struct {
+	http  *http.Client
+	token string
+	url   string
 }
 
-func (e *TelegramError) Error() string {
-	return fmt.Sprintf("Telegram API ошибка %d: %s", e.ErrorCode, e.Description)
-}
-
-func GetRequiredEnv(name string) string {
-	value := os.Getenv(name)
-	if value == "" {
-		fmt.Fprintf(os.Stderr, "ОШИБКА: Не установлена обязательная переменная окружения %s\n", name)
-		os.Exit(1)
-	}
-	return value
-}
-
-func GetBotTokens() (productionToken, alertToken string) {
-	productionToken = GetRequiredEnv(EnvProdToken)
-	alertToken = GetRequiredEnv(EnvAlertToken)
-	return
-}
-
-func parseAPIError(statusCode int, responseBody []byte) error {
-	var telegramErr TelegramError
-	if err := json.Unmarshal(responseBody, &telegramErr); err != nil {
-		return fmt.Errorf("ошибка API: HTTP %d, тело: %s", statusCode, string(responseBody))
-	}
-
-	var additionalInfo string
-	switch statusCode {
-	case 400:
-		additionalInfo = " (Неверный запрос)"
-	case 401:
-		additionalInfo = " (Неавторизованный запрос, проверьте токен бота)"
-	case 403:
-		additionalInfo = " (Запрещено: у бота нет доступа)"
-	case 404:
-		additionalInfo = " (Метод не найден)"
-	case 409:
-		additionalInfo = " (Конфликт)"
-	case 429:
-		additionalInfo = " (Слишком много запросов, превышен лимит)"
-	case 500, 502, 503, 504:
-		additionalInfo = " (Ошибка на стороне серверов Telegram)"
-	}
-
-	return fmt.Errorf("%s%s", telegramErr.Error(), additionalInfo)
-}
-
-type TelegramClient struct {
-	httpClient *http.Client
-	botToken   string
-	apiURL     string
-}
-
-func NewTelegramClient(token string) *TelegramClient {
-	return &TelegramClient{
-		httpClient: &http.Client{
-			Timeout: HTTPTimeout,
-		},
-		botToken: token,
-		apiURL:   APIBaseURL + token,
+func newTGClient(token string) *tgClient {
+	return &tgClient{
+		http:  &http.Client{Timeout: httpTimeout},
+		token: token,
+		url:   apiBaseURL + token,
 	}
 }
 
-func (c *TelegramClient) GetUpdates(ctx context.Context, offset int64) ([]TelegramUpdate, error) {
-	url := c.apiURL + GetUpdatesPath + fmt.Sprintf("?offset=%d&timeout=%d", offset, LongPollTimeout)
+/* ---------- утилиты ---------- */
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func loadTokens(path string) (prod, alert string) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("ошибка создания запроса: %w", err)
+		logerr(err, "couldnt open file", "loadTokens")
+		panic("err check logs")
 	}
+	lines := strings.Fields(strings.TrimSpace(string(data)))
+	if len(lines) < 2 {
+		logerr(fmt.Errorf("-"), "invalid format", "loadTokens")
+		panic("err check logs")
+	}
+	return lines[0], lines[1]
+}
 
-	resp, err := c.httpClient.Do(req)
+func parseAPIError(code int, body []byte) error {
+	var te struct {
+		OK          bool   `json:"ok"`
+		ErrorCode   int    `json:"error_code"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(body, &te); err != nil {
+		logerr(err, "error unmarshalling", "parseAPIError")
+		return err
+	}
+	hint := map[int]string{
+		400: " (Bad Request)", 401: " (Unauthorized — токен?)", 403: " (Forbidden)",
+		404: " (Not Found)", 409: " (Conflict)", 429: " (Too Many Requests)",
+	}[code]
+	if code >= 500 {
+		hint = " (Ошибка на стороне Telegram)"
+	}
+	return fmt.Errorf("Telegram API ошибка %d: %s%s", te.ErrorCode, te.Description, hint)
+}
+
+/* ---------- вызовы Telegram API ---------- */
+
+func getUpdates(c *tgClient, offset int64) ([]telegramUpdate, error) {
+	url := fmt.Sprintf("%s%s?offset=%d&timeout=%d", c.url, getUpdatesPath, offset, longPollTimeout)
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+
+	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("ошибка сетевого соединения: %w", err)
+		return nil, fmt.Errorf("сетевой сбой: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка чтения ответа: %w", err)
+	body, _ := io.ReadAll(resp.Body)
+	var r telegramUpdateResponse
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("невалидный JSON: %w", err)
 	}
-
-	var response TelegramUpdateResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("ошибка разбора JSON: %w", err)
-	}
-
-	if !response.Ok {
+	if !r.OK {
 		return nil, parseAPIError(resp.StatusCode, body)
 	}
-
-	return response.Result, nil
+	return r.Result, nil
 }
 
-func (c *TelegramClient) SendMessage(ctx context.Context, chatID int64, text string) error {
-	message := OutgoingMessage{
-		ChatID:                chatID,
-		Text:                  text,
-		ParseMode:             "Markdown",
-		DisableWebPagePreview: true,
-	}
+func sendMessage(c *tgClient, chatID int64, text string) error {
+	msg := outgoingMessage{ChatID: chatID, Text: text, ParseMode: "Markdown", DisableWebPagePreview: true}
+	data, _ := json.Marshal(msg)
 
-	data, err := json.Marshal(message)
-	if err != nil {
-		return fmt.Errorf("ошибка кодирования JSON: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+SendMessagePath, bytes.NewBuffer(data))
-	if err != nil {
-		return fmt.Errorf("ошибка создания запроса: %w", err)
-	}
+	req, _ := http.NewRequest(http.MethodPost, c.url+sendMessagePath, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("ошибка сетевого соединения: %w", err)
+		return fmt.Errorf("сетевой сбой: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
-
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return parseAPIError(resp.StatusCode, body)
 	}
-
-	var response struct {
+	var ok struct {
 		OK bool `json:"ok"`
 	}
-	if err := json.Unmarshal(body, &response); err != nil || !response.OK {
-		return errors.New("API вернул успешный HTTP код, но флаг ok=false")
+	if err := json.Unmarshal(body, &ok); err != nil || !ok.OK {
+		return errors.New("HTTP 200, но ok=false")
 	}
-
 	return nil
 }
 
-func (c *TelegramClient) SendMessageWithButtons(ctx context.Context, chatID int64, text string, buttonLabels []string, isPersistent bool, buttonsPerRow, breakRowAfter int) error {
-	var keyboard [][]Button
-	var currentRow []Button
+func editMessage(c *tgClient, chatID int64, messageID int, text string) error {
+	payload := map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"text":       text,
+		"parse_mode": "Markdown",
+	}
+	data, _ := json.Marshal(payload)
+	req, _ := http.NewRequest(http.MethodPost, c.url+editMessagePath, bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("edit сетевой сбой: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return parseAPIError(resp.StatusCode, body)
+	}
+	return nil
+}
 
+func sendMessageRID(c *tgClient, chatID int64, text string) (int, error) {
+	msg := outgoingMessage{ChatID: chatID, Text: text, ParseMode: "Markdown", DisableWebPagePreview: true}
+	data, _ := json.Marshal(msg)
+
+	req, _ := http.NewRequest(http.MethodPost, c.url+sendMessagePath, bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("сетевой сбой: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return 0, parseAPIError(resp.StatusCode, body)
+	}
+	var res struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			MessageID int `json:"message_id"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil || !res.OK {
+		return 0, errors.New("HTTP 200, но ok=false")
+	}
+	return res.Result.MessageID, nil
+}
+
+/* func sendMessageWithButtons(
+	c *tgClient,
+	chatID int64,
+	text string,
+	buttonLabels []string,
+	isPersistent bool,
+	perRow, breakAfter int,
+) error {
+
+	var kb [][]button
+	row := []button{}
 	for i, label := range buttonLabels {
-		currentRow = append(currentRow, Button{Text: label})
-
-		if len(currentRow) == buttonsPerRow || i+1 == breakRowAfter {
-			keyboard = append(keyboard, currentRow)
-			currentRow = []Button{}
+		row = append(row, button{Text: label})
+		if len(row) == perRow || i+1 == breakAfter {
+			kb = append(kb, row)
+			row = []button{}
 		}
 	}
-
-	if len(currentRow) > 0 {
-		keyboard = append(keyboard, currentRow)
+	if len(row) > 0 {
+		kb = append(kb, row)
 	}
 
-	message := OutgoingMessageWithKeyboard{
-		ChatID:                chatID,
-		Text:                  text,
-		ParseMode:             "Markdown",
-		DisableWebPagePreview: true,
-		ReplyMarkup: KeyboardMarkup{
-			Keyboard:       keyboard,
-			ResizeKeyboard: true,
-			IsPersistent:   isPersistent,
-		},
+	msg := outgoingMessageWithKB{
+		ChatID: chatID, Text: text, ParseMode: "Markdown", DisableWebPagePreview: true,
+		ReplyMarkup: keyboardMarkup{Keyboard: kb, ResizeKeyboard: true, IsPersistent: isPersistent},
 	}
+	data, _ := json.Marshal(msg)
 
-	data, err := json.Marshal(message)
-	if err != nil {
-		return fmt.Errorf("ошибка кодирования JSON: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+SendMessagePath, bytes.NewBuffer(data))
-	if err != nil {
-		return fmt.Errorf("ошибка создания запроса: %w", err)
-	}
+	req, _ := http.NewRequest(http.MethodPost, c.url+sendMessagePath, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("ошибка сетевого соединения: %w", err)
+		return fmt.Errorf("сетевой сбой: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
-
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return parseAPIError(resp.StatusCode, body)
 	}
-
-	var response struct {
+	var ok struct {
 		OK bool `json:"ok"`
 	}
-	if err := json.Unmarshal(body, &response); err != nil || !response.OK {
-		return errors.New("API вернул успешный HTTP код, но флаг ok=false")
+	if err := json.Unmarshal(body, &ok); err != nil || !ok.OK {
+		return errors.New("HTTP 200, но ok=false")
 	}
-
 	return nil
 }
+NOT NEEDED RN
+*/
 
-// AnswerInline отправляет ответ на inline запрос
-func (c *TelegramClient) AnswerInline(ctx context.Context, queryID string, results []InlineQueryResult) error {
-	answer := AnswerInlineQuery{
-		InlineQueryID: queryID,
-		Results:       results,
-		CacheTime:     300,
-		IsPersonal:    true,
-	}
+func answerInline(c *tgClient, queryID string, results []inlineQueryResult) error {
+	payload := answerInlineQuery{InlineQueryID: queryID, Results: results, CacheTime: 300, IsPersonal: true}
+	data, _ := json.Marshal(payload)
 
-	data, err := json.Marshal(answer)
-	if err != nil {
-		return fmt.Errorf("ошибка кодирования JSON: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+AnswerInlinePath, bytes.NewBuffer(data))
-	if err != nil {
-		return fmt.Errorf("ошибка создания запроса: %w", err)
-	}
+	req, _ := http.NewRequest(http.MethodPost, c.url+answerInlinePath, bytes.NewBuffer(data))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("ошибка сетевого соединения: %w", err)
+		return fmt.Errorf("сетевой сбой: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
-
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return parseAPIError(resp.StatusCode, body)
 	}
-
-	var response struct {
+	var ok struct {
 		OK bool `json:"ok"`
 	}
-	if err := json.Unmarshal(body, &response); err != nil || !response.OK {
-		return errors.New("API вернул успешный HTTP код, но флаг ok=false")
+	if err := json.Unmarshal(body, &ok); err != nil || !ok.OK {
+		return errors.New("HTTP 200, но ok=false")
 	}
-
 	return nil
 }
 
-// Структуры для работы с API
-type TelegramUpdateResponse struct {
-	Ok     bool             `json:"ok"`
-	Result []TelegramUpdate `json:"result"`
+/* ---------- модели ---------- */
+
+type telegramUpdateResponse struct {
+	OK     bool             `json:"ok"`
+	Result []telegramUpdate `json:"result"`
 }
 
-type TelegramUpdate struct {
-	UpdateID    int64           `json:"update_id"`
-	Message     TelegramMessage `json:"message,omitempty"`
-	InlineQuery *InlineQuery    `json:"inline_query,omitempty"`
-}
-
-type TelegramMessage struct {
-	MessageID int64        `json:"message_id"`
-	From      TelegramUser `json:"from"`
-	Chat      TelegramChat `json:"chat"`
-	Date      int64        `json:"date"`
-	Text      string       `json:"text"`
-}
-
-type TelegramUser struct {
-	ID           int64  `json:"id"`
-	IsBot        bool   `json:"is_bot"`
-	FirstName    string `json:"first_name"`
-	LastName     string `json:"last_name"`
-	Username     string `json:"username"`
-	LanguageCode string `json:"language_code"`
-	IsPremium    bool   `json:"is_premium"`
-}
-
-type TelegramChat struct {
+type telegramUser struct {
 	ID        int64  `json:"id"`
 	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
 	Username  string `json:"username"`
-	Type      string `json:"type"`
 }
 
-// Структуры для отправки сообщений
-type OutgoingMessage struct {
+type telegramChat struct {
+	ID   int64  `json:"id"`
+	Type string `json:"type"`
+}
+
+/* ---- outgoing ---- */
+
+type outgoingMessage struct {
 	ChatID                int64  `json:"chat_id"`
 	Text                  string `json:"text"`
 	ParseMode             string `json:"parse_mode,omitempty"`
 	DisableWebPagePreview bool   `json:"disable_web_page_preview,omitempty"`
 }
 
-type OutgoingMessageWithKeyboard struct {
+type outgoingMessageWithKB struct {
 	ChatID                int64          `json:"chat_id"`
 	Text                  string         `json:"text"`
 	ParseMode             string         `json:"parse_mode,omitempty"`
 	DisableWebPagePreview bool           `json:"disable_web_page_preview,omitempty"`
-	ReplyMarkup           KeyboardMarkup `json:"reply_markup"`
+	ReplyMarkup           keyboardMarkup `json:"reply_markup"`
 }
 
-type KeyboardMarkup struct {
-	Keyboard       [][]Button `json:"keyboard"`
+type keyboardMarkup struct {
+	Keyboard       [][]button `json:"keyboard"`
 	ResizeKeyboard bool       `json:"resize_keyboard"`
 	IsPersistent   bool       `json:"is_persistent"`
 }
 
-type Button struct {
+type button struct {
 	Text string `json:"text"`
 }
 
-// Структуры для inline запросов
-type InlineQuery struct {
-	ID     string       `json:"id"`
-	From   TelegramUser `json:"from"`
-	Query  string       `json:"query"`
-	Offset string       `json:"offset"`
+/* ---- inline ---- */
+
+type inlineQuery struct {
+	ID    string       `json:"id"`
+	From  telegramUser `json:"from"`
+	Query string       `json:"query"`
 }
 
-type InlineQueryResult interface {
-	GetType() string
-}
+type inlineQueryResult interface{ GetType() string }
 
-type InlineQueryResultArticle struct {
+type inlineQueryResultArticle struct {
 	Type         string              `json:"type"`
 	ID           string              `json:"id"`
 	Title        string              `json:"title"`
 	Description  string              `json:"description,omitempty"`
-	ThumbURL     string              `json:"thumb_url,omitempty"`
-	InputMessage InputMessageContent `json:"input_message_content"`
+	InputMessage inputMessageContent `json:"input_message_content"`
 }
 
-func (r InlineQueryResultArticle) GetType() string {
-	return r.Type
-}
+func (r inlineQueryResultArticle) GetType() string { return r.Type }
 
-type InputMessageContent struct {
+type inputMessageContent struct {
 	MessageText string `json:"message_text"`
 	ParseMode   string `json:"parse_mode,omitempty"`
 }
 
-type AnswerInlineQuery struct {
+type answerInlineQuery struct {
 	InlineQueryID string              `json:"inline_query_id"`
-	Results       []InlineQueryResult `json:"results"`
+	Results       []inlineQueryResult `json:"results"`
 	CacheTime     int                 `json:"cache_time,omitempty"`
 	IsPersonal    bool                `json:"is_personal,omitempty"`
+}
+
+type apiResponse struct {
+	Ok          bool            `json:"ok"`
+	Description string          `json:"description,omitempty"`
+	Result      json.RawMessage `json:"result,omitempty"`
+}
+
+// SendPhoto отправляет в чат (по chatID) фотографию из локального файла photoPath.
+// caption — необязательная подпись к фото (может быть пустой строкой).
+func SendPhoto(chatID int64, photoPath, caption string) error {
+	// Берём токен из переменных окружения
+	// Открываем файл с фоткой
+	file, err := os.Open(photoPath)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть файл %q: %w", photoPath, err)
+	}
+	defer file.Close()
+
+	// Создаём буфер и multipart writer
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	// 1) Поле chat_id
+	if err := writer.WriteField("chat_id", fmt.Sprint(chatID)); err != nil {
+		return fmt.Errorf("ошибка при добавлении поля chat_id: %w", err)
+	}
+
+	// 2) Поле caption (даже если пустая строка, Telegram пропустит)
+	if caption != "" {
+		if err := writer.WriteField("caption", caption); err != nil {
+			return fmt.Errorf("ошибка при добавлении поля caption: %w", err)
+		}
+	}
+
+	// 3) Поле photo (сам файл). Имя поля должно быть "photo"
+	part, err := writer.CreateFormFile("photo", filepath.Base(photoPath))
+	if err != nil {
+		return fmt.Errorf("ошибка при создании form-file: %w", err)
+	}
+
+	// Копируем содержимое файла в multipart
+	if _, err := io.Copy(part, file); err != nil {
+		return fmt.Errorf("не удалось скопировать содержимое файла: %w", err)
+	}
+
+	// Завершаем формирование multipart
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("ошибка при закрытии writer: %w", err)
+	}
+
+	// Формируем URL: https://api.telegram.org/bot<token>/sendPhoto
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", botToken)
+
+	// Делаем POST-запрос с нашим multipart-контентом
+	req, err := http.NewRequest("POST", url, &buf)
+	if err != nil {
+		return fmt.Errorf("ошибка при создании запроса: %w", err)
+	}
+	// Устанавливаем правильный заголовок
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	// Выполняем запрос
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("ошибка HTTP-запроса: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Декодим ответ Telegram
+	var apiResp apiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return fmt.Errorf("не удалось распарсить ответ Telegram: %w", err)
+	}
+
+	if !apiResp.Ok {
+		return fmt.Errorf("Telegram API вернул ошибку: %s", apiResp.Description)
+	}
+
+	return nil
 }
