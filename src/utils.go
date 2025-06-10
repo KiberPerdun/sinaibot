@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"io/ioutil"
+	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -171,4 +177,124 @@ func accumulateAndEdit(c *tgClient, chatID int64, messageID int, username string
 		full := strings.Join(buffer, "")
 		_ = editMessage(c, chatID, messageID, fmt.Sprintf("%s, %s", username, full))
 	}
+}
+
+func getallusers() []string {
+	filename := "/home/sinaibot/msgs"
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("Не удалось открыть файл: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	uniques := make(map[string]struct{})
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, "|")
+		if len(parts) >= 3 {
+			username := parts[3] // 3-й столбец
+			uniques[username] = struct{}{}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("Ошибка при чтении файла: %v", err)
+	}
+
+	// Выводим все уникальные username
+	var ret []string
+	for user := range uniques {
+		ret = append(ret, user)
+	}
+	return ret
+}
+
+type TranslateRequest struct {
+	Q      string `json:"q"`
+	Source string `json:"source"`
+	Target string `json:"target"`
+}
+
+// TranslateResponse — ожидаемая структура ответа от /translate
+type TranslateResponse struct {
+	TranslatedText string `json:"translatedText"`
+}
+
+func Translate(q, source, target string) (string, error) {
+	// собираем тело запроса
+	reqBody := TranslateRequest{
+		Q:      q,
+		Source: source,
+		Target: target,
+	}
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("не удалось маршалить запрос: %w", err)
+	}
+
+	// делаем POST
+	resp, err := http.Post("http://localhost:10110/translate", "application/json", bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("ошибка HTTP POST: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// читаем ответ
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("не удалось прочитать ответ: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("сервер вернул %d: %s", resp.StatusCode, string(body))
+	}
+
+	// распарсим JSON
+	var tr TranslateResponse
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return "", fmt.Errorf("не удалось распарсить JSON: %w", err)
+	}
+
+	return tr.TranslatedText, nil
+}
+
+func detectLanguage(text string) (string, error) {
+	// Адрес твоего LibreTranslate
+	url := "http://localhost:10110/detect"
+
+	// Формируем JSON
+	requestBody, err := json.Marshal(map[string]string{
+		"q": text,
+	})
+	if err != nil {
+		return "", fmt.Errorf("ошибка маршала JSON: %v", err)
+	}
+
+	// Отправляем POST-запрос
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(requestBody))
+	if err != nil {
+		return "", fmt.Errorf("ошибка при POST-запросе: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Читаем тело ответа
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("ошибка чтения ответа: %v", err)
+	}
+
+	// Структура для ответа
+	var result []struct {
+		Language   string  `json:"language"`
+		Confidence float64 `json:"confidence"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("ошибка парсинга JSON: %v", err)
+	}
+
+	if len(result) == 0 {
+		return "", fmt.Errorf("ничего не найдено")
+	}
+
+	return result[0].Language, nil
 }

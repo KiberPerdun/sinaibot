@@ -105,7 +105,7 @@ func getUpdates(c *tgClient, offset int64) ([]telegramUpdate, error) {
 }
 
 func sendMessage(c *tgClient, chatID int64, text string) error {
-	msg := outgoingMessage{ChatID: chatID, Text: text, ParseMode: "Markdown", DisableWebPagePreview: true}
+	msg := outgoingMessage{ChatID: chatID, Text: text, ParseMode: "", DisableWebPagePreview: true}
 	data, _ := json.Marshal(msg)
 
 	req, _ := http.NewRequest(http.MethodPost, c.url+sendMessagePath, bytes.NewBuffer(data))

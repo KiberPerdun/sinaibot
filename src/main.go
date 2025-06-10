@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,6 +15,7 @@ import (
 /* ---------- session ---------------------------------------------------- */
 
 var chatid_to_user map[int64]telegramUser
+var auth_users = []string{"programju", "KiberPerdun", "nakiperu", "nullpointerrr", "potsield", "jotunn_polaris", "wh1t34ox", "0xEEEEE", "xfrbt", "Softgod", "bluprod", "Ciscouse", "go_B_tanki", "dogdjgift", "Tunay69", "egunuraka", "cq_rs", "Shonoy", "vehsorg", "marina_cpp", "press_to_pnick", "unknownguy228", "vietnam_veteran", "нуль форма", "heaven99990", "oldestme", "konakona06", "nextdoor_psycho", "umchg", "neutraluser", "kurumihere", "pablusha", "qat_ears", "na1tero", "lomosgame228", "OneBumBot", "jackpot_enjoyer", "rafchapw", "kiqoi", "gj0dfrg39f7v7eanpf90e0re8i19h5ku", "unsignedlong", "q1w23re", "refrct", "kotvkvante", "kellaux", "I0xbkaker", "c4llv07e", "A11131111", "val_ep", "char_ptr", "nfjdkq", "nagornin", "ivanvet31"}
 
 type UserSession struct {
 	userID       int64
@@ -199,8 +201,15 @@ func checkai_req(msg string, chatID int64, username string, c *tgClient) {
 		}
 	}
 }
+
+var allowedchats = []int64{-1002084477597}
+
 func startUserSession(wg *sync.WaitGroup, s *UserSession) {
 	defer wg.Done()
+	if !slices.Contains(allowedchats, s.userID) {
+		sendMessage(s.client, s.userID, "Бот доступен только в синае")
+		return
+	}
 	log.Printf("[session %d] started", s.userID)
 
 	for msg := range s.messageChan {
@@ -213,12 +222,32 @@ func startUserSession(wg *sync.WaitGroup, s *UserSession) {
 
 		checkai_req(msg, s.userID, user.Username, s.client)
 		getbilling(msg, s.client, s.userID)
+		pingall(msg, s.userID, s.client, user.Username)
 		//fmt.Println(msg, s.User)
 		/*if err := sendMessage(s.client, s.userID, msg); err != nil {
 			diagnoseTelegramError(err)
 		}*/
 	}
 	log.Printf("[session %d] stopped", s.userID)
+}
+
+var lastping int64
+
+func pingall(msg string, chatid int64, c *tgClient, username string) {
+	if msg != "/pingall" || !slices.Contains(auth_users, username) || (lastping != 0 && time.Now().Unix()-lastping < 60*60) {
+		if (lastping != 0 && time.Now().Unix()-lastping < 60*60) && msg == "/pingall" {
+			sendMessage(c, chatid, "/pingall доступна только раз в час")
+		}
+		return
+	}
+
+	lastping = time.Now().Unix()
+
+	users := getallusers()
+	for i := 0; i < len(users); i++ {
+		users[i] = "@" + users[i]
+	}
+	sendMessage(c, chatid, strings.Join(users, ", "))
 }
 
 func diagnoseTelegramError(err error) {
