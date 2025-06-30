@@ -26,7 +26,11 @@ func logerr(err error, comment, function string) {
 	fmt.Println(errmsg)
 	writeFileA(logpath, []byte(errmsg))
 }
-
+func FNV(s string) string {
+	hasher := fnv.New64()
+	hasher.Write([]byte(s))
+	return fmt.Sprintf("%d", hasher.Sum64())
+}
 func writeFileA(path string, b []byte) error {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {

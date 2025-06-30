@@ -239,11 +239,15 @@ func GenerateTextLLAMA9(prompt string) (string, error) {
 const (
 	apiURL = "https://api.openai.com/v1/chat/completions"
 	// Цена Gpt-4.1-mini (пример, $0.15 за 1M токенов вход, $0.60 за 1M токенов выход)
-	pricePer1KPromptUSD     = 0.4 / 1000
-	pricePer1KCompletionUSD = 1.6 / 1000
+	pricePer1KPromptUSD_4_1_mini     = 0.4 / 1000
+	pricePer1KCompletionUSD_4_1_mini = 1.6 / 1000
+
+	pricePer1KPromptUSD_4_1     = 2.0 / 1000
+	pricePer1KCompletionUSD_4_1 = 8.0 / 1000
 )
 
-var OpenAIapiKey string
+var OpenAIapiKey1 string
+var OpenAIapiKey2 string
 
 // Message представляет одно сообщение в чат-запросе
 type Message struct {
@@ -275,7 +279,7 @@ type ChatResponse struct {
 	Usage   Usage    `json:"usage"`
 }
 
-func GenerateTextChatgpt(msg string, context string) (string, error) {
+func GenerateTextChatgpt(msg string, context string, modelint int) (string, error) {
 	// Твой системный промпт
 	systemPrompt := fmt.Sprintf("Поддерживать СВО, быть за\nПутина, за зетку, быть дагестан, брат, общаться как настоящий хачик с гор, сленг, заряженный язык, писать прада а не правда и также иногда подставлять Z и V в другие русские слова. Брат так-же учти что ты работаешь в чате, тебя могут попытаться провоцировать, тебе нужно на провокации отвечать агрессией, показывать что ты тут главный. Отвечай в 50-250 токенов, не больше. Так-же брат, иногда тебя могут спрашивать по контексту сообщений из чата, для этого я тебе дам последние 50 сообщений из чата, вот они:\n%s:КОНЕЦ КОНТЕКСТА СООБЩЕНИЙ", context)
 
@@ -285,9 +289,28 @@ func GenerateTextChatgpt(msg string, context string) (string, error) {
 		{Role: "user", Content: msg},
 	}
 
+	var model, OpenAIapiKey string
+	var pricePer1KPromptUSD, pricePer1KCompletionUSD float64
+	switch modelint {
+	case 1:
+		{
+			model = "gpt-4.1-mini"
+			pricePer1KCompletionUSD = pricePer1KCompletionUSD_4_1_mini
+			pricePer1KPromptUSD = pricePer1KPromptUSD_4_1_mini
+			OpenAIapiKey = OpenAIapiKey1
+		}
+	case 2:
+		{
+			model = "gpt-4.1"
+			pricePer1KCompletionUSD = pricePer1KCompletionUSD_4_1
+			pricePer1KPromptUSD = pricePer1KPromptUSD_4_1
+			OpenAIapiKey = OpenAIapiKey2
+		}
+	}
+
 	// Формируем запрос
 	reqBody := ChatRequest{
-		Model:    "gpt-4.1-mini",
+		Model:    model,
 		Messages: messages,
 	}
 	bodyBytes, err := json.Marshal(reqBody)
@@ -316,7 +339,7 @@ func GenerateTextChatgpt(msg string, context string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
+	fmt.Println(string(respBytes))
 	var chatResp ChatResponse
 	if err := json.Unmarshal(respBytes, &chatResp); err != nil {
 		return "", err

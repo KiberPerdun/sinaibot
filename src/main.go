@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -90,6 +91,8 @@ func checkai_req(msg string, chatID int64, username string, c *tgClient) {
 	switch model {
 	case "llama":
 		{
+			sendMessage(c, chatID, "модель временно недоступна")
+			return
 			if context != "f" && context != "t" {
 				_ = sendMessage(c, chatID, "Контекст может быть только t или f")
 				return
@@ -167,10 +170,10 @@ func checkai_req(msg string, chatID int64, username string, c *tgClient) {
 			}
 
 			if context == "t" {
-				if lastcontextusage != 0 && (time.Now().Unix()-lastcontextusage) < 60*30 {
+				if lastcontextusage != 0 && (time.Now().Unix()-lastcontextusage) < 60*5 {
 					sendMessage(c, chatID, "Вы не можете использовать контекст чаще, чем 1 раз в 30 минут. Генерация продолжится без контекста")
 					last100 = "NONE"
-					goto nocontext
+					goto nocontext1
 				}
 				lastcontextusage = time.Now().Unix()
 				last100, err = GetLast100Msgs()
@@ -182,11 +185,50 @@ func checkai_req(msg string, chatID int64, username string, c *tgClient) {
 				last100 = "NONE"
 			}
 
-		nocontext:
+		nocontext1:
 
 			_ = sendMessage(c, chatID, fmt.Sprintf("%s, генерация (model=%s, context=%s) началась...", username, model, context))
 
-			answer, err := GenerateTextChatgpt(msg, last100)
+			answer, err := GenerateTextChatgpt(msg, last100, 1)
+			if err != nil {
+				logerr(err, "error generating response", "checkai_req")
+			}
+			err = sendMessage(c, chatID, fmt.Sprintf("@%s, %s", username, answer))
+			if err != nil {
+				err = sendMessage(c, chatID, answer)
+			}
+		}
+	case "gpt_new":
+		{
+			var last100 string
+			var err error
+
+			if context != "f" && context != "t" {
+				_ = sendMessage(c, chatID, "Контекст может быть только t или f")
+				return
+			}
+
+			if context == "t" {
+				if lastcontextusage != 0 && (time.Now().Unix()-lastcontextusage) < 60*5 {
+					sendMessage(c, chatID, "Вы не можете использовать контекст чаще, чем 1 раз в 30 минут. Генерация продолжится без контекста")
+					last100 = "NONE"
+					goto nocontext2
+				}
+				lastcontextusage = time.Now().Unix()
+				last100, err = GetLast100Msgs()
+				if err != nil {
+					logerr(err, "getting last msgs", "checkai_req")
+					last100 = "NONE"
+				}
+			} else {
+				last100 = "NONE"
+			}
+
+		nocontext2:
+
+			_ = sendMessage(c, chatID, fmt.Sprintf("%s, генерация (model=%s, context=%s) началась...", username, model, context))
+
+			answer, err := GenerateTextChatgpt(msg, last100, 2)
 			if err != nil {
 				logerr(err, "error generating response", "checkai_req")
 			}
@@ -206,10 +248,6 @@ var allowedchats = []int64{-1002084477597}
 
 func startUserSession(wg *sync.WaitGroup, s *UserSession) {
 	defer wg.Done()
-	if !slices.Contains(allowedchats, s.userID) {
-		sendMessage(s.client, s.userID, "Бот доступен только в синае")
-		return
-	}
 	log.Printf("[session %d] started", s.userID)
 
 	for msg := range s.messageChan {
@@ -223,6 +261,17 @@ func startUserSession(wg *sync.WaitGroup, s *UserSession) {
 		checkai_req(msg, s.userID, user.Username, s.client)
 		getbilling(msg, s.client, s.userID)
 		pingall(msg, s.userID, s.client, user.Username)
+
+		if strings.Contains(msg, "/voteban_start") {
+			voteban(s.client, s.userID, msg)
+		}
+
+		if strings.Contains(msg, "/voteagainst_") {
+			handle_voteagainst(msg, user.Username, s.client, s.userID)
+		}
+		if strings.Contains(msg, "/votefor_") {
+			handle_votefor(msg, user.Username, s.client, s.userID)
+		}
 		//fmt.Println(msg, s.User)
 		/*if err := sendMessage(s.client, s.userID, msg); err != nil {
 			diagnoseTelegramError(err)
@@ -260,6 +309,116 @@ func diagnoseTelegramError(err error) {
 	case strings.Contains(e, "too many requests"):
 		log.Println("Совет: превысил лимит Telegram API — замедлитесь")
 	}
+}
+
+var votebans_for map[string]int
+var votebans_mu sync.Mutex
+var votebans_against map[string]int
+
+func voteban(c *tgClient, chatID int64, msg string) {
+	fmt.Println("hh0")
+	spl := strings.Split(msg, " ")
+	if len(spl) < 3 {
+		sendMessage(c, chatID, "Используйте /voteban_start <комментарий голосования> <время голосования(в секундах)>")
+		return
+	}
+
+	time_, err := strconv.Atoi(spl[len(spl)-1])
+	if err != nil {
+		sendMessage(c, chatID, "time должно быть цифрой")
+		return
+	}
+
+	endtime := time.Now().Unix() + int64(time_)
+
+	voteid := FNV(msg)
+	fmt.Println("hh1")
+	votebans_mu.Lock()
+	votebans_for[voteid] = 0
+	votebans_against[voteid] = 0
+	votebans_mu.Unlock()
+	fmt.Println("hh2")
+	go handle_voteban(strings.Join(spl[1:(len(spl)-1)], " "), voteid, endtime, chatID, c)
+}
+
+func handle_voteban(topic, voteid string, end_time, chat_id int64, c *tgClient) {
+	err := sendMessage(c, chat_id, fmt.Sprintf("Голосование на тему: \"%s\" - начато.\nID голосования: %s\n\nЧтобы проголосовать за /votefor_%s\nЧтобы проголосовать против /voteagainst_%s\n\nГолосование продлится %d секунд", topic, voteid, voteid, voteid, end_time-time.Now().Unix()))
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+	for {
+		if time.Now().Unix() == end_time {
+			votebans_mu.Lock()
+			sendMessage(c, chat_id, fmt.Sprintf("Голосование окончено.\nТема: %s\nГолос за/против: %d/%d", topic, votebans_for[voteid], votebans_against[voteid]))
+			votebans_mu.Unlock()
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+var store_votes []string
+var store_votes_mu sync.Mutex
+
+func check_if_voted(voterid string) bool {
+	store_votes_mu.Lock()
+
+	for i := 0; i < len(store_votes); i++ {
+		if store_votes[i] == voterid {
+			store_votes_mu.Unlock()
+			return true
+		}
+	}
+
+	store_votes_mu.Unlock()
+	return false
+}
+
+func handle_votefor(msg string, username string, c *tgClient, chatID int64) {
+	spl := strings.Split(msg, "_")
+	if len(spl) != 2 {
+		sendMessage(c, chatID, "Неверный формат")
+		return
+	}
+
+	voted := check_if_voted(FNV(spl[1] + username))
+	if voted == true {
+		sendMessage(c, chatID, "Вы уже голосовали за это")
+		return
+	}
+
+	votebans_mu.Lock()
+	votebans_for[spl[1]]++
+	votebans_mu.Unlock()
+
+	store_votes_mu.Lock()
+	store_votes = append(store_votes, FNV(spl[1]+username))
+	store_votes_mu.Unlock()
+
+	sendMessage(c, chatID, "Success")
+}
+
+func handle_voteagainst(msg string, username string, c *tgClient, chatID int64) {
+	spl := strings.Split(msg, "_")
+	if len(spl) != 2 {
+		sendMessage(c, chatID, "Неверный формат")
+		return
+	}
+
+	voted := check_if_voted(FNV(spl[1] + username))
+	if voted == true {
+		sendMessage(c, chatID, "Вы уже голосовали за это")
+		return
+	}
+
+	votebans_mu.Lock()
+	votebans_against[spl[1]]++
+	votebans_mu.Unlock()
+
+	store_votes_mu.Lock()
+	store_votes = append(store_votes, FNV(spl[1]+username))
+	store_votes_mu.Unlock()
+
+	sendMessage(c, chatID, "Success")
 }
 
 /* ---------- store ------------------------------------------------------ */
@@ -381,8 +540,13 @@ func main() {
 	if err != nil {
 		panic(err.Error())
 	}
-	OpenAIapiKey = string(openait)[:len(openait)-1]
-	fmt.Println(OpenAIapiKey)
+	OpenAIapiKey1 = string(openait)[:len(openait)-1]
+	openait, err = os.ReadFile("/home/sinaibot/openai_token2")
+	if err != nil {
+		panic(err.Error())
+	}
+	OpenAIapiKey2 = string(openait)[:len(openait)-1]
+	fmt.Println(OpenAIapiKey2)
 
 	botToken = prodToken // pochinit' nado bi
 	client := newTGClient(prodToken)
@@ -392,6 +556,9 @@ func main() {
 	var wg sync.WaitGroup
 
 	/* --- обработка приходящих событий --- */
+
+	votebans_for = make(map[string]int)
+	votebans_against = make(map[string]int)
 
 	go func() {
 		for n := range newMemCh {

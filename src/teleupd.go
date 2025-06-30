@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 )
 
@@ -152,33 +153,39 @@ func startUpdatePolling(c *tgClient) (
 				_, _ = json.MarshalIndent(u, "", "  ")
 
 				// --- текстовые сообщения
-				if u.Message != nil && u.Message.Text != "" {
-					msgCh <- MessageEvent{
-						UserID: u.Message.Chat.ID,
-						Text:   u.Message.Text,
+				fmt.Println("h1")
+				if u.Message != nil {
+					if slices.Contains(allowedchats, u.Message.Chat.ID) {
+						fmt.Println("h2")
+						if u.Message != nil && u.Message.Text != "" {
+							msgCh <- MessageEvent{
+								UserID: u.Message.Chat.ID,
+								Text:   u.Message.Text,
+							}
+							chatid_to_user[u.Message.Chat.ID] = u.Message.From
+						}
+
+						// --- inline-запросы
+						if iq := u.InlineQuery; iq != nil {
+							inlineCh <- InlineEvent{
+								QueryID: iq.ID,
+								UserID:  iq.From.ID,
+								Query:   iq.Query,
+							}
+						}
+
+						// --- новые участники
+						ss, _ := json.Marshal(u)
+						fmt.Println(string(ss))
+						ResNewMem := DetectNewMembers(u)
+						for i := 0; i < len(ResNewMem); i++ {
+							newMemCh <- NewMemberEvent{UserID: ResNewMem[i].UserID, ChatID: ResNewMem[i].ChatID}
+						}
 					}
-					chatid_to_user[u.Message.Chat.ID] = u.Message.From
-				}
 
-				// --- inline-запросы
-				if iq := u.InlineQuery; iq != nil {
-					inlineCh <- InlineEvent{
-						QueryID: iq.ID,
-						UserID:  iq.From.ID,
-						Query:   iq.Query,
+					if u.UpdateID >= offset {
+						offset = u.UpdateID + 1
 					}
-				}
-
-				// --- новые участники
-				ss, _ := json.Marshal(u)
-				fmt.Println(string(ss))
-				ResNewMem := DetectNewMembers(u)
-				for i := 0; i < len(ResNewMem); i++ {
-					newMemCh <- NewMemberEvent{UserID: ResNewMem[i].UserID, ChatID: ResNewMem[i].ChatID}
-				}
-
-				if u.UpdateID >= offset {
-					offset = u.UpdateID + 1
 				}
 			}
 		}
